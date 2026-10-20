@@ -9,10 +9,15 @@ const COLLECT_MS = 680;
 const REVEAL_MS = 3000;
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const RECONNECT_GRACE_MS = 90 * 1000;
+const AUTO_AI_TAKEOVER_MS = 60 * 1000;
+const HOST_MIGRATE_MS = 15 * 1000;
 const AI_DELAY_MS = 650;
 const AI_NAMES = ['Rakib','Rashed','Shiblu','Siful'];
 
 const rooms = new Map();
+const quickQueue = [];
+let lastWsHeartbeat = 0;
+
 
 function safeSend(ws, payload) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
@@ -31,6 +36,8 @@ function publicLobby(room) {
     roomCode: room.code,
     targetScore: room.targetScore,
     started: room.started,
+    mode: room.mode || 'private',
+    hostSeat: Number.isInteger(room.hostSeat) ? room.hostSeat : 0,
     players: room.players.map(p => p ? { seat:p.seat, clientId:p.clientId, name:p.name, avatar:p.avatar, connected:!!p.connected, isAI:!!p.isAI } : null)
   };
 }
@@ -54,6 +61,9 @@ function makeViewState(room, viewer) {
   s.canDeclareSideOff = !!(e.sideOffEligible[viewer] && !e.sideOffDeclared[viewer]);
   s.sideOffEligible = e.sideOffEligible.map((v,p) => p === viewer ? v : false);
   s.sideOffCount = e.sideOffCount.map((v,p) => p === viewer ? v : (e.sideOffDeclared[p] ? 1 : 0));
+  s.players = s.players.map((p,i)=>({ ...p, onlineConnected: !!room.players[i]?.connected, isAI: !!room.players[i]?.isAI }));
+  s.onlineHostSeat = Number.isInteger(room.hostSeat) ? room.hostSeat : 0;
+  s.onlineMode = room.mode || 'private';
   s.event = room.event;
   s.roomCode = room.code;
   return s;
@@ -125,7 +135,7 @@ function sendGame(room) {
 
 function attachPlayer(room, seat, ws, clientId, name, avatar) {
   const p = room.players[seat] || { seat, clientId, name:cleanName(name), avatar:cleanAvatar(avatar), connected:true, ws:null, disconnectedAt:0 };
-  p.clientId = clientId; p.name = cleanName(name || p.name); p.avatar = cleanAvatar(avatar || p.avatar); p.connected = true; p.ws = ws; p.disconnectedAt = 0; p.isAI = false;
+  p.clientId = clientId; p.name = cleanName(name || p.name); p.avatar = cleanAvatar(avatar || p.avatar); p.connected = true; p.ws = ws; p.disconnectedAt = 0; p.reservationExpired=false; p.isAI = false;
   room.players[seat] = p;
   ws.meta = { roomCode:room.code, clientId, seat };
   room.updatedAt = Date.now();
@@ -183,7 +193,7 @@ async function performAction(room, seat, action, data={}) {
   if (action === 'nextInvalid') { e.cancelInvalidAndAdvance(true); event(room,'shuffle-ready',{dealer:e.dealer}); sendGame(room); return; }
   if (action === 'nextHand') { e.advanceDealerAndStart(true); event(room,'shuffle-ready',{dealer:e.dealer}); sendGame(room); return; }
   if (action === 'newMatch') {
-    if (seat !== 0) throw new Error('Only the host can start a new match');
+    if (seat !== room.hostSeat) throw new Error('Only the host can start a new match');
     const names=room.players.map(p=>p.name), avatars=room.players.map(p=>p.avatar), dealer=e.next(e.dealer);
     room.engine=new ItalianBridgeEngine({playerNames:names,avatars,targetScore:room.targetScore,dealer});
     room.engine.players.forEach((p,i)=>p.human=!isAISeat(room,i)); room.engine.prepareManualHand(); event(room,'shuffle-ready',{dealer:room.engine.dealer}); sendGame(room); return;
@@ -191,8 +201,49 @@ async function performAction(room, seat, action, data={}) {
   throw new Error('Unknown action');
 }
 
+
+function removeQuickClient(clientId) {
+  for (let i=quickQueue.length-1;i>=0;i--) if (quickQueue[i].clientId===clientId) quickQueue.splice(i,1);
+  for (let i=0;i<quickQueue.length;i++) safeSend(quickQueue[i].ws,{type:'quick_waiting',count:quickQueue.length,position:i+1});
+}
+function startRoom(room) {
+  if (!room || room.started || room.players.filter(Boolean).length!==4) return false;
+  const names=room.players.map(p=>p.name), avatars=room.players.map(p=>p.avatar);
+  room.engine=new ItalianBridgeEngine({playerNames:names,avatars,targetScore:room.targetScore});
+  room.engine.players.forEach((p,i)=>p.human=!isAISeat(room,i));
+  room.engine.prepareManualHand(); room.started=true; event(room,'shuffle-ready',{dealer:room.engine.dealer}); sendLobby(room); sendGame(room); return true;
+}
+function tryMatchQuick() {
+  while (quickQueue.length >= 4) {
+    const group=quickQueue.splice(0,4);
+    const code=roomCode();
+    const room={code,hostClientId:group[0].clientId,hostSeat:0,mode:'quick',targetScore:50,players:[null,null,null,null],started:false,engine:null,eventId:0,event:null,transitionLock:false,aiTimer:null,createdAt:Date.now(),updatedAt:Date.now()};
+    rooms.set(code,room);
+    group.forEach((x,seat)=>attachPlayer(room,seat,x.ws,x.clientId,x.name,x.avatar));
+    group.forEach((x,seat)=>safeSend(x.ws,{type:'quick_matched',roomCode:code,seat,lobby:publicLobby(room)}));
+    sendLobby(room);
+    setTimeout(()=>startRoom(room),350);
+  }
+  for (let i=0;i<quickQueue.length;i++) safeSend(quickQueue[i].ws,{type:'quick_waiting',count:quickQueue.length,position:i+1});
+}
+function migrateHostIfNeeded(room, now=Date.now()) {
+  if (!room || room.mode==='quick') return;
+  const hs=Number.isInteger(room.hostSeat)?room.hostSeat:0, hp=room.players[hs];
+  if (hp && (hp.connected || hp.isAI)) return;
+  if (hp && hp.disconnectedAt && now-hp.disconnectedAt < HOST_MIGRATE_MS) return;
+  const next=room.players.findIndex(p=>p && p.connected && !p.isAI);
+  if (next>=0 && next!==hs) { room.hostSeat=next; room.hostClientId=room.players[next].clientId; event(room,'host-migrated',{player:next}); room.started?sendGame(room):sendLobby(room); }
+}
+function replaceSeatWithAI(room, seat, reason='manual') {
+  seat=Number(seat); const old=room.players[seat]; if(!old || old.isAI) return false;
+  const ai={seat,clientId:`AI-${room.code}-${seat}-${Date.now().toString(36)}`,name:`${old.name} AI`,avatar:old.avatar,connected:true,ws:null,disconnectedAt:0,isAI:true};
+  room.players[seat]=ai;
+  if(room.engine){room.engine.players[seat].name=ai.name;room.engine.players[seat].avatar=ai.avatar;room.engine.players[seat].human=false;}
+  event(room,'player-replaced-ai',{player:seat,reason}); room.started?sendGame(room):sendLobby(room); return true;
+}
+
 const server = http.createServer((req,res)=>{
-  if (req.url === '/health') { res.writeHead(200,{'content-type':'application/json'}); return res.end(JSON.stringify({ok:true,rooms:rooms.size,at:Date.now()})); }
+  if (req.url === '/health') { res.writeHead(200,{'content-type':'application/json'}); return res.end(JSON.stringify({ok:true,rooms:rooms.size,quickWaiting:quickQueue.length,version:'0.3.0',at:Date.now()})); }
   res.writeHead(200,{'content-type':'text/plain'}); res.end('Italian Bridge Online Server');
 });
 const wss = new WebSocketServer({ server });
@@ -200,13 +251,21 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', ws => {
   ws.isAlive = true;
   ws.on('pong',()=>ws.isAlive=true);
-  safeSend(ws,{type:'hello',server:'Italian Bridge Online',version:'0.2.0'});
+  safeSend(ws,{type:'hello',server:'Italian Bridge Online',version:'0.3.0'});
   ws.on('message', raw => {
     let m; try{m=JSON.parse(raw.toString())}catch(_){return safeSend(ws,{type:'error',message:'Invalid message'})}
     const clientId=String(m.clientId||'').slice(0,64); if(!clientId) return safeSend(ws,{type:'error',message:'Missing client id'});
     try {
+      if (m.type === 'quick_match') {
+        removeQuickClient(clientId);
+        quickQueue.push({ws,clientId,name:cleanName(m.name),avatar:cleanAvatar(m.avatar),joinedAt:Date.now()});
+        ws.meta={quick:true,clientId};
+        safeSend(ws,{type:'quick_waiting',count:quickQueue.length,position:quickQueue.length});
+        tryMatchQuick(); return;
+      }
+      if (m.type === 'cancel_quick') { removeQuickClient(clientId); try{ws.close()}catch(_){} return; }
       if (m.type === 'create_room') {
-        const code=roomCode(); const room={code,hostClientId:clientId,targetScore:TARGETS.includes(Number(m.targetScore))?Number(m.targetScore):50,players:[null,null,null,null],started:false,engine:null,eventId:0,event:null,transitionLock:false,aiTimer:null,createdAt:Date.now(),updatedAt:Date.now()};
+        const code=roomCode(); const room={code,hostClientId:clientId,hostSeat:0,mode:'private',targetScore:TARGETS.includes(Number(m.targetScore))?Number(m.targetScore):50,players:[null,null,null,null],started:false,engine:null,eventId:0,event:null,transitionLock:false,aiTimer:null,createdAt:Date.now(),updatedAt:Date.now()};
         rooms.set(code,room); attachPlayer(room,0,ws,clientId,m.name,m.avatar); safeSend(ws,{type:'room_created',roomCode:code,seat:0,lobby:publicLobby(room)}); sendLobby(room); return;
       }
       const code=String(m.roomCode||''); const room=rooms.get(code); if(!room) throw new Error('Room not found');
@@ -217,12 +276,12 @@ wss.on('connection', ws => {
         attachPlayer(room,seat,ws,clientId,m.name,m.avatar); safeSend(ws,{type:'room_joined',roomCode:code,seat,lobby:publicLobby(room)}); sendLobby(room); return;
       }
       if (m.type === 'reconnect') {
-        const seat=findSeatByClient(room,clientId); if(seat<0) throw new Error('Your seat is no longer reserved');
+        const seat=findSeatByClient(room,clientId); if(seat<0 || room.players[seat]?.reservationExpired) throw new Error('Your seat is no longer reserved');
         attachPlayer(room,seat,ws,clientId,m.name,m.avatar); safeSend(ws,{type:'room_reconnected',roomCode:code,seat,lobby:publicLobby(room)}); event(room,'player-reconnected',{player:seat}); room.started?sendGame(room):sendLobby(room); return;
       }
       const seat=findSeatByClient(room,clientId); if(seat<0) throw new Error('You are not in this room');
       if (m.type === 'add_ai') {
-        if (seat!==0 || room.started) throw new Error('Only the host can add AI before start');
+        if (seat!==room.hostSeat || room.started || room.mode!=='private') throw new Error('Only the host can add AI before start');
         const aiSeat=Number(m.seat);
         if (![1,2,3].includes(aiSeat)) throw new Error('Invalid AI seat');
         if (room.players[aiSeat]) throw new Error('That seat is already occupied');
@@ -230,27 +289,32 @@ wss.on('connection', ws => {
         event(room,'ai-added',{player:aiSeat}); sendLobby(room); return;
       }
       if (m.type === 'remove_ai') {
-        if (seat!==0 || room.started) throw new Error('Only the host can remove AI before start');
+        if (seat!==room.hostSeat || room.started || room.mode!=='private') throw new Error('Only the host can remove AI before start');
         const aiSeat=Number(m.seat), p=room.players[aiSeat];
         if (![1,2,3].includes(aiSeat) || !p || !p.isAI) throw new Error('No AI player in that seat');
         room.players[aiSeat]=null; event(room,'ai-removed',{player:aiSeat}); sendLobby(room); return;
       }
       if (m.type === 'set_target') {
-        if (seat!==0 || room.started) throw new Error('Only the host can change target before start');
+        if (seat!==room.hostSeat || room.started || room.mode!=='private') throw new Error('Only the host can change target before start');
         if (!TARGETS.includes(Number(m.targetScore))) throw new Error('Invalid target score');
         room.targetScore=Number(m.targetScore); sendLobby(room); return;
       }
       if (m.type === 'start_room') {
-        if (seat!==0) throw new Error('Only the host can start');
+        if (seat!==room.hostSeat || room.mode!=='private') throw new Error('Only the host can start');
         if (room.players.filter(Boolean).length!==4) throw new Error('Four players are required');
         if (room.players.some(p=>!p.connected)) throw new Error('All players must be connected');
-        const names=room.players.map(p=>p.name), avatars=room.players.map(p=>p.avatar);
-        room.engine=new ItalianBridgeEngine({playerNames:names,avatars,targetScore:room.targetScore}); room.engine.players.forEach((p,i)=>p.human=!isAISeat(room,i)); room.engine.prepareManualHand(); room.started=true; event(room,'shuffle-ready',{dealer:room.engine.dealer}); sendLobby(room); sendGame(room); return;
+        startRoom(room); return;
+      }
+      if (m.type === 'replace_disconnected_ai') {
+        if (seat!==room.hostSeat) throw new Error('Only the host can replace a disconnected player');
+        const target=Number(m.seat), p=room.players[target];
+        if (![0,1,2,3].includes(target) || !p || p.connected || p.isAI) throw new Error('That player is not disconnected');
+        replaceSeatWithAI(room,target,'host'); return;
       }
       if (m.type === 'action') { return performAction(room,seat,m.action,m.data||{}).catch(err=>safeSend(ws,{type:'error',message:err.message||'Action failed'})); }
       if (m.type === 'leave_room') {
         const p=room.players[seat]; if(p){p.connected=false;p.ws=null;p.disconnectedAt=Date.now()}
-        if (seat===0 && !room.started) { for(const x of room.players) if(x&&x.ws) safeSend(x.ws,{type:'room_closed'}); if(room.aiTimer)clearTimeout(room.aiTimer); rooms.delete(code); }
+        if (seat===room.hostSeat && !room.started) { for(const x of room.players) if(x&&x.ws) safeSend(x.ws,{type:'room_closed'}); if(room.aiTimer)clearTimeout(room.aiTimer); rooms.delete(code); }
         else { if(room.started){event(room,'player-disconnected',{player:seat});sendGame(room)}else { room.players[seat]=null; sendLobby(room); } }
         try{ws.close()}catch(_){} return;
       }
@@ -258,7 +322,7 @@ wss.on('connection', ws => {
     } catch(err) { safeSend(ws,{type:'error',message:err.message||'Server error'}); }
   });
   ws.on('close',()=>{
-    const meta=ws.meta; if(!meta)return; const room=rooms.get(meta.roomCode); if(!room)return; const seat=findSeatByClient(room,meta.clientId); if(seat<0)return; const p=room.players[seat]; if(p&&p.ws===ws){p.connected=false;p.ws=null;p.disconnectedAt=Date.now(); if(room.started){event(room,'player-disconnected',{player:seat});sendGame(room)}else sendLobby(room)}
+    const meta=ws.meta; if(!meta)return; if(meta.quick){removeQuickClient(meta.clientId);return;} const room=rooms.get(meta.roomCode); if(!room)return; const seat=findSeatByClient(room,meta.clientId); if(seat<0)return; const p=room.players[seat]; if(p&&p.ws===ws){p.connected=false;p.ws=null;p.disconnectedAt=Date.now(); if(room.started){event(room,'player-disconnected',{player:seat});sendGame(room)}else sendLobby(room)}
   });
 });
 
@@ -268,9 +332,16 @@ setInterval(()=>{
     autoBidTimeout(room);
     const connected=room.players.some(p=>p&&p.connected);
     if (!connected && now-room.updatedAt>ROOM_TTL_MS) { if(room.aiTimer)clearTimeout(room.aiTimer); rooms.delete(room.code); }
-    for (const p of room.players) if(p&&!p.connected&&p.disconnectedAt&&now-p.disconnectedAt>RECONNECT_GRACE_MS) p.reservationExpired=true;
+    migrateHostIfNeeded(room,now);
+    for (const p of room.players) {
+      if(p&&!p.connected&&!p.isAI&&p.disconnectedAt&&room.started&&now-p.disconnectedAt>AUTO_AI_TAKEOVER_MS){ replaceSeatWithAI(room,p.seat,'timeout'); continue; }
+      if(p&&!p.connected&&p.disconnectedAt&&now-p.disconnectedAt>RECONNECT_GRACE_MS) p.reservationExpired=true;
+    }
   }
-  for (const ws of wss.clients) { if(ws.isAlive===false){try{ws.terminate()}catch(_){}} else {ws.isAlive=false;try{ws.ping()}catch(_){}} }
+  if (now-lastWsHeartbeat>25000) {
+    lastWsHeartbeat=now;
+    for (const ws of wss.clients) { if(ws.isAlive===false){try{ws.terminate()}catch(_){}} else {ws.isAlive=false;try{ws.ping()}catch(_){}} }
+  }
 },1000);
 
 server.listen(PORT,HOST,()=>console.log(`Italian Bridge Online Server listening on ${HOST}:${PORT}`));
