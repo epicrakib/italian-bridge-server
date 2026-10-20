@@ -9,6 +9,8 @@ const COLLECT_MS = 680;
 const REVEAL_MS = 3000;
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const RECONNECT_GRACE_MS = 90 * 1000;
+const AI_DELAY_MS = 650;
+const AI_NAMES = ['Rakib','Rashed','Shiblu','Siful'];
 
 const rooms = new Map();
 
@@ -29,7 +31,7 @@ function publicLobby(room) {
     roomCode: room.code,
     targetScore: room.targetScore,
     started: room.started,
-    players: room.players.map(p => p ? { seat:p.seat, clientId:p.clientId, name:p.name, avatar:p.avatar, connected:!!p.connected } : null)
+    players: room.players.map(p => p ? { seat:p.seat, clientId:p.clientId, name:p.name, avatar:p.avatar, connected:!!p.connected, isAI:!!p.isAI } : null)
   };
 }
 function event(room, type, data={}) {
@@ -60,12 +62,70 @@ function sendLobby(room) {
   const payload = { type:'lobby_state', lobby:publicLobby(room) };
   for (const p of room.players) if (p && p.ws) safeSend(p.ws, payload);
 }
+function isAISeat(room, seat) {
+  const p = room.players[Number(seat)];
+  return !!(p && p.isAI);
+}
+function queueAI(room, delay=AI_DELAY_MS) {
+  if (!room || !room.started || !room.engine || room.aiTimer) return;
+  room.aiTimer = setTimeout(async()=>{
+    room.aiTimer = null;
+    try { await runAI(room); } catch (err) { console.error('AI turn failed', room.code, err && err.message ? err.message : err); }
+  }, delay);
+}
+async function runAI(room) {
+  if (!room.started || !room.engine) return;
+  if (room.transitionLock) { queueAI(room, 350); return; }
+  const e = room.engine;
+
+  // AI announces Side Off automatically, just like offline computer players.
+  if (['playing','trick_complete'].includes(e.phase)) {
+    for (let seat=0; seat<4; seat++) {
+      if (isAISeat(room,seat) && e.sideOffEligible[seat] && !e.sideOffDeclared[seat]) {
+        e.declareSideOff(seat);
+        event(room,'side-off',{player:seat});
+        sendGame(room);
+        return;
+      }
+    }
+  }
+
+  if (e.phase === 'shuffle' && isAISeat(room,e.dealer)) {
+    if (e.shuffleCount < 1) {
+      e.shufflePreparedDeck(); event(room,'shuffle',{player:e.dealer,count:e.shuffleCount}); sendGame(room); return;
+    }
+    e.dealInitialFive(); event(room,'deal-initial',{dealer:e.dealer}); sendGame(room); return;
+  }
+  if (e.phase === 'bidding') {
+    const seat=e.biddingPlayer();
+    if (isAISeat(room,seat)) {
+      const before=e.phase, bid=e.estimateBid(seat), blind=e.aiWantsBlind(seat,bid);
+      e.placeBid(seat,bid,blind);
+      event(room,before==='bidding'&&e.phase!=='bidding'&&e.highBidBlind?'deal-rest':'bid',{player:seat,bid,blind});
+      sendGame(room); return;
+    }
+  }
+  if (e.phase === 'choose_trump' && isAISeat(room,e.highBidder)) {
+    const seat=e.highBidder, suit=e.chooseTrumpAI(seat);
+    e.setTrump(seat,suit); event(room,'deal-rest',{player:seat}); sendGame(room); return;
+  }
+  if (e.phase === 'playing' && isAISeat(room,e.currentPlayer)) {
+    const seat=e.currentPlayer;
+    if (e.canRevealTrump(seat) && e.aiShouldRevealTrump(seat)) {
+      await performAction(room,seat,'reveal',{}); return;
+    }
+    const cardId=e.aiChooseCard(seat);
+    if (cardId) { await performAction(room,seat,'play',{cardId}); return; }
+  }
+}
 function sendGame(room) {
   for (const p of room.players) if (p && p.ws) safeSend(p.ws, { type:'game_state', state:makeViewState(room,p.seat) });
+  queueAI(room);
 }
+
 function attachPlayer(room, seat, ws, clientId, name, avatar) {
   const p = room.players[seat] || { seat, clientId, name:cleanName(name), avatar:cleanAvatar(avatar), connected:true, ws:null, disconnectedAt:0 };
-  p.clientId = clientId; p.name = cleanName(name || p.name); p.avatar = cleanAvatar(avatar || p.avatar); p.connected = true; p.ws = ws; p.disconnectedAt = 0;
+  p.clientId = clientId; p.name = cleanName(name || p.name); p.avatar = cleanAvatar(avatar || p.avatar); p.connected = true; p.ws = ws; p.disconnectedAt = 0; p.isAI = false;
   room.players[seat] = p;
   ws.meta = { roomCode:room.code, clientId, seat };
   room.updatedAt = Date.now();
@@ -126,7 +186,7 @@ async function performAction(room, seat, action, data={}) {
     if (seat !== 0) throw new Error('Only the host can start a new match');
     const names=room.players.map(p=>p.name), avatars=room.players.map(p=>p.avatar), dealer=e.next(e.dealer);
     room.engine=new ItalianBridgeEngine({playerNames:names,avatars,targetScore:room.targetScore,dealer});
-    room.engine.players.forEach(p=>p.human=true); room.engine.prepareManualHand(); event(room,'shuffle-ready',{dealer:room.engine.dealer}); sendGame(room); return;
+    room.engine.players.forEach((p,i)=>p.human=!isAISeat(room,i)); room.engine.prepareManualHand(); event(room,'shuffle-ready',{dealer:room.engine.dealer}); sendGame(room); return;
   }
   throw new Error('Unknown action');
 }
@@ -140,13 +200,13 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', ws => {
   ws.isAlive = true;
   ws.on('pong',()=>ws.isAlive=true);
-  safeSend(ws,{type:'hello',server:'Italian Bridge Online',version:'0.1.0'});
+  safeSend(ws,{type:'hello',server:'Italian Bridge Online',version:'0.2.0'});
   ws.on('message', raw => {
     let m; try{m=JSON.parse(raw.toString())}catch(_){return safeSend(ws,{type:'error',message:'Invalid message'})}
     const clientId=String(m.clientId||'').slice(0,64); if(!clientId) return safeSend(ws,{type:'error',message:'Missing client id'});
     try {
       if (m.type === 'create_room') {
-        const code=roomCode(); const room={code,hostClientId:clientId,targetScore:TARGETS.includes(Number(m.targetScore))?Number(m.targetScore):50,players:[null,null,null,null],started:false,engine:null,eventId:0,event:null,transitionLock:false,createdAt:Date.now(),updatedAt:Date.now()};
+        const code=roomCode(); const room={code,hostClientId:clientId,targetScore:TARGETS.includes(Number(m.targetScore))?Number(m.targetScore):50,players:[null,null,null,null],started:false,engine:null,eventId:0,event:null,transitionLock:false,aiTimer:null,createdAt:Date.now(),updatedAt:Date.now()};
         rooms.set(code,room); attachPlayer(room,0,ws,clientId,m.name,m.avatar); safeSend(ws,{type:'room_created',roomCode:code,seat:0,lobby:publicLobby(room)}); sendLobby(room); return;
       }
       const code=String(m.roomCode||''); const room=rooms.get(code); if(!room) throw new Error('Room not found');
@@ -161,6 +221,20 @@ wss.on('connection', ws => {
         attachPlayer(room,seat,ws,clientId,m.name,m.avatar); safeSend(ws,{type:'room_reconnected',roomCode:code,seat,lobby:publicLobby(room)}); event(room,'player-reconnected',{player:seat}); room.started?sendGame(room):sendLobby(room); return;
       }
       const seat=findSeatByClient(room,clientId); if(seat<0) throw new Error('You are not in this room');
+      if (m.type === 'add_ai') {
+        if (seat!==0 || room.started) throw new Error('Only the host can add AI before start');
+        const aiSeat=Number(m.seat);
+        if (![1,2,3].includes(aiSeat)) throw new Error('Invalid AI seat');
+        if (room.players[aiSeat]) throw new Error('That seat is already occupied');
+        room.players[aiSeat]={seat:aiSeat,clientId:`AI-${room.code}-${aiSeat}`,name:AI_NAMES[aiSeat]||`AI ${aiSeat}`,avatar:`a${((aiSeat*7+5)%28)+1}`,connected:true,ws:null,disconnectedAt:0,isAI:true};
+        event(room,'ai-added',{player:aiSeat}); sendLobby(room); return;
+      }
+      if (m.type === 'remove_ai') {
+        if (seat!==0 || room.started) throw new Error('Only the host can remove AI before start');
+        const aiSeat=Number(m.seat), p=room.players[aiSeat];
+        if (![1,2,3].includes(aiSeat) || !p || !p.isAI) throw new Error('No AI player in that seat');
+        room.players[aiSeat]=null; event(room,'ai-removed',{player:aiSeat}); sendLobby(room); return;
+      }
       if (m.type === 'set_target') {
         if (seat!==0 || room.started) throw new Error('Only the host can change target before start');
         if (!TARGETS.includes(Number(m.targetScore))) throw new Error('Invalid target score');
@@ -171,13 +245,13 @@ wss.on('connection', ws => {
         if (room.players.filter(Boolean).length!==4) throw new Error('Four players are required');
         if (room.players.some(p=>!p.connected)) throw new Error('All players must be connected');
         const names=room.players.map(p=>p.name), avatars=room.players.map(p=>p.avatar);
-        room.engine=new ItalianBridgeEngine({playerNames:names,avatars,targetScore:room.targetScore}); room.engine.players.forEach(p=>p.human=true); room.engine.prepareManualHand(); room.started=true; event(room,'shuffle-ready',{dealer:room.engine.dealer}); sendLobby(room); sendGame(room); return;
+        room.engine=new ItalianBridgeEngine({playerNames:names,avatars,targetScore:room.targetScore}); room.engine.players.forEach((p,i)=>p.human=!isAISeat(room,i)); room.engine.prepareManualHand(); room.started=true; event(room,'shuffle-ready',{dealer:room.engine.dealer}); sendLobby(room); sendGame(room); return;
       }
       if (m.type === 'action') { return performAction(room,seat,m.action,m.data||{}).catch(err=>safeSend(ws,{type:'error',message:err.message||'Action failed'})); }
       if (m.type === 'leave_room') {
         const p=room.players[seat]; if(p){p.connected=false;p.ws=null;p.disconnectedAt=Date.now()}
-        if (seat===0 && !room.started) { for(const x of room.players) if(x&&x.ws) safeSend(x.ws,{type:'room_closed'}); rooms.delete(code); }
-        else { if(room.started){event(room,'player-disconnected',{player:seat});sendGame(room)}else sendLobby(room) }
+        if (seat===0 && !room.started) { for(const x of room.players) if(x&&x.ws) safeSend(x.ws,{type:'room_closed'}); if(room.aiTimer)clearTimeout(room.aiTimer); rooms.delete(code); }
+        else { if(room.started){event(room,'player-disconnected',{player:seat});sendGame(room)}else { room.players[seat]=null; sendLobby(room); } }
         try{ws.close()}catch(_){} return;
       }
       if (m.type === 'ping') return safeSend(ws,{type:'pong',at:Date.now()});
@@ -193,7 +267,7 @@ setInterval(()=>{
   for (const room of rooms.values()) {
     autoBidTimeout(room);
     const connected=room.players.some(p=>p&&p.connected);
-    if (!connected && now-room.updatedAt>ROOM_TTL_MS) rooms.delete(room.code);
+    if (!connected && now-room.updatedAt>ROOM_TTL_MS) { if(room.aiTimer)clearTimeout(room.aiTimer); rooms.delete(room.code); }
     for (const p of room.players) if(p&&!p.connected&&p.disconnectedAt&&now-p.disconnectedAt>RECONNECT_GRACE_MS) p.reservationExpired=true;
   }
   for (const ws of wss.clients) { if(ws.isAlive===false){try{ws.terminate()}catch(_){}} else {ws.isAlive=false;try{ws.ping()}catch(_){}} }
